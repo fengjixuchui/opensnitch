@@ -14,7 +14,7 @@ import (
 
 const (
 	// max number of events to keep in the buffer
-	maxEvents = 50
+	maxEvents = 100
 	// max number of entries for each By* map
 	maxStats = 25
 )
@@ -26,7 +26,7 @@ type conEvent struct {
 }
 
 type Statistics struct {
-	sync.Mutex
+	sync.RWMutex
 
 	Started      time.Time
 	DNSResponses int
@@ -134,7 +134,7 @@ func (s *Statistics) onConnection(con *conman.Connection, match *rule.Rule, wasM
 		s.RuleHits++
 	}
 
-	if match.Action == rule.Allow {
+	if wasMissed == false && match.Action == rule.Allow {
 		s.Accepted++
 	} else {
 		s.Dropped++
@@ -154,6 +154,9 @@ func (s *Statistics) onConnection(con *conman.Connection, match *rule.Rule, wasM
 	nEvents := len(s.Events)
 	if nEvents == maxEvents {
 		s.Events = s.Events[1:]
+	}
+	if wasMissed {
+		return
 	}
 	s.Events = append(s.Events, NewEvent(con, match))
 }
