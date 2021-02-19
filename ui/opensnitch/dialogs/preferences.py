@@ -4,19 +4,18 @@ import os
 import json
 
 from PyQt5 import QtCore, QtGui, uic, QtWidgets
+from PyQt5.QtCore import QCoreApplication as QC
 
 from config import Config
 from nodes import Nodes
+from database import Database
+from utils import Message
 
 import ui_pb2
 
 DIALOG_UI_PATH = "%s/../res/preferences.ui" % os.path.dirname(sys.modules[__name__].__file__)
 class PreferencesDialog(QtWidgets.QDialog, uic.loadUiType(DIALOG_UI_PATH)[0]):
 
-    CFG_DEFAULT_ACTION   = "global/default_action"
-    CFG_DEFAULT_DURATION = "global/default_duration"
-    CFG_DEFAULT_TARGET   = "global/default_target"
-    CFG_DEFAULT_TIMEOUT  = "global/default_timeout"
     CFG_DISABLE_POPUPS   = "global/disable_popups"
 
     LOG_TAG = "[Preferences] "
@@ -27,21 +26,27 @@ class PreferencesDialog(QtWidgets.QDialog, uic.loadUiType(DIALOG_UI_PATH)[0]):
 
         self._cfg = Config.get()
         self._nodes = Nodes.instance()
+        self._db = Database.instance()
 
         self._notification_callback.connect(self._cb_notification_callback)
         self._notifications_sent = {}
 
         self.setupUi(self)
 
+        self.dbFileButton.setVisible(False)
+        self.dbLabel.setVisible(False)
+
         self.acceptButton.clicked.connect(self._cb_accept_button_clicked)
         self.applyButton.clicked.connect(self._cb_apply_button_clicked)
         self.cancelButton.clicked.connect(self._cb_cancel_button_clicked)
         self.popupsCheck.clicked.connect(self._cb_popups_check_toggled)
+        self.dbFileButton.clicked.connect(self._cb_file_db_clicked)
 
         if QtGui.QIcon.hasThemeIcon("emblem-default") == False:
             self.applyButton.setIcon(self.style().standardIcon(getattr(QtWidgets.QStyle, "SP_DialogApplyButton")))
             self.cancelButton.setIcon(self.style().standardIcon(getattr(QtWidgets.QStyle, "SP_DialogCloseButton")))
             self.acceptButton.setIcon(self.style().standardIcon(getattr(QtWidgets.QStyle, "SP_DialogSaveButton")))
+            self.dbFileButton.setIcon(self.style().standardIcon(getattr(QtWidgets.QStyle, "SP_DirOpenIcon")))
 
     def showEvent(self, event):
         super(PreferencesDialog, self).showEvent(event)
@@ -73,18 +78,22 @@ class PreferencesDialog(QtWidgets.QDialog, uic.loadUiType(DIALOG_UI_PATH)[0]):
         self.comboNodeAddress.currentIndexChanged.connect(self._cb_node_needs_update)
         self.checkInterceptUnknown.clicked.connect(self._cb_node_needs_update)
         self.checkApplyToNodes.clicked.connect(self._cb_node_needs_update)
+        self.comboDBType.currentIndexChanged.connect(self._cb_db_type_changed)
 
         # True when any node option changes
         self._node_needs_update = False
 
     def _load_settings(self):
-        self._default_action = self._cfg.getInt(self.CFG_DEFAULT_ACTION)
-        self._default_duration = self._cfg.getInt(self.CFG_DEFAULT_DURATION)
-        self._default_target = self._cfg.getSettings(self.CFG_DEFAULT_TARGET)
-        self._default_timeout = self._cfg.getSettings(self.CFG_DEFAULT_TIMEOUT)
+        self._default_action = self._cfg.getInt(self._cfg.DEFAULT_ACTION_KEY)
+        self._default_target = self._cfg.getSettings(self._cfg.DEFAULT_TARGET_KEY)
+        self._default_timeout = self._cfg.getSettings(self._cfg.DEFAULT_TIMEOUT_KEY)
         self._disable_popups = self._cfg.getBool(self.CFG_DISABLE_POPUPS)
 
-        # TODO: move to config.get_duration()
+        if self._cfg.hasKey(self._cfg.DEFAULT_DURATION_KEY):
+            self._default_duration = self._cfg.getInt(self._cfg.DEFAULT_DURATION_KEY)
+        else:
+            self._default_duration = self._cfg.DEFAULT_DURATION_IDX
+
         self.comboUIDuration.setCurrentIndex(self._default_duration)
 
         self.comboUIAction.setCurrentIndex(self._default_action)
@@ -92,6 +101,12 @@ class PreferencesDialog(QtWidgets.QDialog, uic.loadUiType(DIALOG_UI_PATH)[0]):
         self.spinUITimeout.setValue(int(self._default_timeout))
         self.spinUITimeout.setEnabled(not self._disable_popups)
         self.popupsCheck.setChecked(self._disable_popups)
+
+        self.comboDBType.setCurrentIndex(self._cfg.getInt(self._cfg.DEFAULT_DB_TYPE_KEY))
+        if self.comboDBType.currentIndex() != Database.DB_TYPE_MEMORY:
+            self.dbFileButton.setVisible(True)
+            self.dbLabel.setVisible(True)
+            self.dbLabel.setText(self._cfg.getSettings(self._cfg.DEFAULT_DB_FILE_KEY))
 
         self._load_node_settings()
 
@@ -134,15 +149,15 @@ class PreferencesDialog(QtWidgets.QDialog, uic.loadUiType(DIALOG_UI_PATH)[0]):
 
     def _save_settings(self):
         if self.tabWidget.currentIndex() == 0:
-            self._cfg.setSettings(self.CFG_DEFAULT_ACTION, self.comboUIAction.currentIndex())
-            self._cfg.setSettings(self.CFG_DEFAULT_DURATION, int(self.comboUIDuration.currentIndex()))
-            self._cfg.setSettings(self.CFG_DEFAULT_TARGET, self.comboUITarget.currentIndex())
-            self._cfg.setSettings(self.CFG_DEFAULT_TIMEOUT, self.spinUITimeout.value())
+            self._cfg.setSettings(self._cfg.DEFAULT_ACTION_KEY, self.comboUIAction.currentIndex())
+            self._cfg.setSettings(self._cfg.DEFAULT_DURATION_KEY, int(self.comboUIDuration.currentIndex()))
+            self._cfg.setSettings(self._cfg.DEFAULT_TARGET_KEY, self.comboUITarget.currentIndex())
+            self._cfg.setSettings(self._cfg.DEFAULT_TIMEOUT_KEY, self.spinUITimeout.value())
             self._cfg.setSettings(self.CFG_DISABLE_POPUPS, bool(self.popupsCheck.isChecked()))
             # this is a workaround for not display pop-ups.
             # see #79 for more information.
             if self.popupsCheck.isChecked():
-                self._cfg.setSettings(self.CFG_DEFAULT_TIMEOUT, 0)
+                self._cfg.setSettings(self._cfg.DEFAULT_TIMEOUT_KEY, 0)
 
         elif self.tabWidget.currentIndex() == 1:
             self._show_status_label()
@@ -168,13 +183,33 @@ class PreferencesDialog(QtWidgets.QDialog, uic.loadUiType(DIALOG_UI_PATH)[0]):
                             return
                 except Exception as e:
                     print(self.LOG_TAG + "exception saving config: ", e)
-                    self._set_status_error(QtCore.QCoreApplication.translate("preferences", "Exception saving config: {0}").format(str(e)))
+                    self._set_status_error(QC.translate("preferences", "Exception saving config: {0}").format(str(e)))
 
             self._node_needs_update = False
 
+        elif self.tabWidget.currentIndex() == 2:
+            dbtype = self.comboDBType.currentIndex()
+            self._cfg.setSettings(Config.DEFAULT_DB_TYPE_KEY, dbtype)
+            if dbtype == self._db.get_db_file():
+                return
+            if self.comboDBType.currentIndex() != Database.DB_TYPE_MEMORY:
+                if self.dbLabel.text() != "":
+                    self._cfg.setSettings(Config.DEFAULT_DB_FILE_KEY, self.dbLabel.text())
+                else:
+                    Message.ok(
+                        QC.translate("preferences", "Warning"),
+                        QC.translate("preferences", "You must select a file for the database<br>or choose \"In memory\" type."),
+                        QtWidgets.QMessageBox.Warning)
+                    return
+
+            Message.ok(
+                QC.translate("preferences", "DB type changed"),
+                QC.translate("preferences", "Restart the GUI in order effects to take effect"),
+                QtWidgets.QMessageBox.Warning)
+
     def _save_node_config(self, notifObject, addr):
         try:
-            self._set_status_message(QtCore.QCoreApplication.translate("preferences", "Applying configuration on {0} ...").format(addr))
+            self._set_status_message(QC.translate("preferences", "Applying configuration on {0} ...").format(addr))
             notifObject.data, error = self._load_node_config(addr)
             if error != None:
                 return error
@@ -185,7 +220,7 @@ class PreferencesDialog(QtWidgets.QDialog, uic.loadUiType(DIALOG_UI_PATH)[0]):
             self._notifications_sent[nid] = notifObject
         except Exception as e:
             print(self.LOG_TAG + "exception saving node config on %s: " % addr, e)
-            self._set_status_error(QtCore.QCoreApplication.translate("Exception saving node config {0}: {1}").format((addr, str(e))))
+            self._set_status_error(QC.translate("Exception saving node config {0}: {1}").format((addr, str(e))))
             return addr + ": " + str(e)
 
         return None
@@ -193,7 +228,7 @@ class PreferencesDialog(QtWidgets.QDialog, uic.loadUiType(DIALOG_UI_PATH)[0]):
     def _load_node_config(self, addr):
         try:
             if self.comboNodeAddress.currentText() == "":
-                return None, QtCore.QCoreApplication.translate("preferences", "Server address can not be empty")
+                return None, QC.translate("preferences", "Server address can not be empty")
 
             node_action = Config.ACTION_DENY
             if self.comboNodeAction.currentIndex() == 1:
@@ -215,7 +250,6 @@ class PreferencesDialog(QtWidgets.QDialog, uic.loadUiType(DIALOG_UI_PATH)[0]):
             if node_config.get('Server') != None:
                 # skip setting Server Address if we're applying the config to all nodes
                 if self.checkApplyToNodes.isChecked():
-                    print("skipping server address")
                     node_config['Server']['Address'] = self.comboNodeAddress.currentText()
                 node_config['Server']['LogFile'] = self.comboNodeLogFile.currentText()
             #else:
@@ -224,7 +258,7 @@ class PreferencesDialog(QtWidgets.QDialog, uic.loadUiType(DIALOG_UI_PATH)[0]):
         except Exception as e:
             print(self.LOG_TAG + "exception loading node config on %s: " % addr, e)
 
-        return None, QtCore.QCoreApplication.translate("preferences", "Error loading {0} configuration").format(addr)
+        return None, QC.translate("preferences", "Error loading {0} configuration").format(addr)
 
     def _hide_status_label(self):
         self.statusLabel.hide()
@@ -252,11 +286,25 @@ class PreferencesDialog(QtWidgets.QDialog, uic.loadUiType(DIALOG_UI_PATH)[0]):
         #print(self.LOG_TAG, "Config notification received: ", reply.id, reply.code)
         if reply.id in self._notifications_sent:
             if reply.code == ui_pb2.OK:
-                self._set_status_successful(QtCore.QCoreApplication.translate("preferences", "Configuration applied."))
+                self._set_status_successful(QC.translate("preferences", "Configuration applied."))
             else:
-                self._set_status_error(QtCore.QCoreApplication.translate("preferences", "Error applying configuration: {0}").format(reply.data))
+                self._set_status_error(QC.translate("preferences", "Error applying configuration: {0}").format(reply.data))
 
             del self._notifications_sent[reply.id]
+
+    def _cb_file_db_clicked(self):
+        options = QtWidgets.QFileDialog.Options()
+        fileName, _ = QtWidgets.QFileDialog.getSaveFileName(self, "", "","All Files (*)", options=options)
+        if fileName:
+            self.dbLabel.setText(fileName)
+
+    def _cb_db_type_changed(self):
+        if self.comboDBType.currentIndex() == Database.DB_TYPE_MEMORY:
+            self.dbFileButton.setVisible(False)
+            self.dbLabel.setVisible(False)
+        else:
+            self.dbFileButton.setVisible(True)
+            self.dbLabel.setVisible(True)
 
     def _cb_accept_button_clicked(self):
         self._save_settings()
